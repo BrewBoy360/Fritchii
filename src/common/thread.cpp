@@ -52,6 +52,9 @@
 #ifdef __linux__
 #include <sys/resource.h>
 #include <algorithm>
+#include <fstream>
+#include <map>
+#include <utility>
 
 namespace {
 constexpr int NICE_AUDIO = -16;
@@ -717,6 +720,104 @@ void SetCurrentThreadToPerformanceCores() {
 #endif
 }
 
+#if defined(__linux__) && !defined(__ANDROID__)
+namespace {
+/// Logical processors PinCurrentThread gave the GPU front and back threads (Linux).
+std::atomic<u64> linux_pinned_gpu_mask{};
+
+/// "0-3,8-11" -> mask of logical processors below 64.
+u64 ParseCpuList(const std::string& list) {
+    u64 mask = 0;
+    size_t pos = 0;
+    while (pos < list.size()) {
+        const size_t comma = list.find(',', pos);
+        const std::string part = list.substr(pos, comma == std::string::npos ? std::string::npos
+                                                                              : comma - pos);
+        const size_t dash = part.find('-');
+        const int first = std::atoi(part.c_str());
+        const int last = dash == std::string::npos ? first : std::atoi(part.c_str() + dash + 1);
+        for (int cpu = first; cpu <= last && cpu < 64; ++cpu) {
+            if (cpu >= 0) {
+                mask |= u64{1} << cpu;
+            }
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        pos = comma + 1;
+    }
+    return mask;
+}
+
+std::string ReadSysfs(const std::string& path) {
+    std::ifstream in(path);
+    std::string value;
+    std::getline(in, value);
+    return value;
+}
+
+/// The Windows reader's topology from sysfs: physical cores (package id + core id) as masks of
+/// the logical processors this process may run on, in order of their lowest one; hybrid x86
+/// (cpu_atom) cores in a lower efficiency class; L3 caches by shared_cpu_list.
+Common::ThreadPinning::Topology ReadPinningTopologyLinux() {
+    Common::ThreadPinning::Topology topology;
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+        return topology;
+    }
+    topology.logical_processors = static_cast<u32>(CPU_COUNT(&allowed));
+    const u64 atom = ParseCpuList(ReadSysfs("/sys/devices/cpu_atom/cpus"));
+    std::map<std::pair<long, long>, u64> by_core;
+    std::map<u64, u64> l3; // mask -> size
+    for (int cpu = 0; cpu < 64 && cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &allowed)) {
+            continue;
+        }
+        const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(cpu);
+        const std::string package = ReadSysfs(base + "/topology/physical_package_id");
+        const std::string core = ReadSysfs(base + "/topology/core_id");
+        if (package.empty() || core.empty()) {
+            return Common::ThreadPinning::Topology{}; // No topology: leave threads alone.
+        }
+        by_core[{std::atol(package.c_str()), std::atol(core.c_str())}] |= u64{1} << cpu;
+        for (int index = 0; index < 8; ++index) {
+            const std::string cache = base + "/cache/index" + std::to_string(index);
+            const std::string level = ReadSysfs(cache + "/level");
+            if (level.empty()) {
+                break;
+            }
+            if (level == "3") {
+                const u64 shared = ParseCpuList(ReadSysfs(cache + "/shared_cpu_list"));
+                const std::string size = ReadSysfs(cache + "/size"); // "8192K"
+                u64 bytes = std::strtoull(size.c_str(), nullptr, 10);
+                if (!size.empty() && (size.back() == 'K' || size.back() == 'k')) {
+                    bytes <<= 10;
+                } else if (!size.empty() && (size.back() == 'M' || size.back() == 'm')) {
+                    bytes <<= 20;
+                }
+                if (shared != 0) {
+                    l3[shared] = bytes;
+                }
+            }
+        }
+    }
+    std::vector<std::pair<u64, u64>> cores; // (lowest cpu, mask)
+    for (const auto& [key, mask] : by_core) {
+        cores.emplace_back(static_cast<u64>(std::countr_zero(mask)), mask);
+    }
+    std::sort(cores.begin(), cores.end());
+    for (const auto& [lowest, mask] : cores) {
+        topology.cores.push_back({mask, static_cast<u8>((mask & atom) != 0 ? 0 : 1)});
+    }
+    for (const auto& [mask, size] : l3) {
+        topology.l3.push_back({mask, size});
+    }
+    return topology;
+}
+} // Anonymous namespace
+#endif
+
 void PinCurrentThread(PinnedRole role) {
 #ifdef _WIN32
     // Off with EDEN_NX2_PIN_THREADS=0, forced with 1, otherwise on with enough performance cores
@@ -751,6 +852,43 @@ void PinCurrentThread(PinnedRole role) {
             pinned_gpu_mask.fetch_or(mask, std::memory_order_relaxed);
         }
     }
+#elif defined(__linux__) && !defined(__ANDROID__)
+    // Local: the Linux port of the Windows path above. The same plan (ThreadPinning::MakePlan,
+    // EDEN_NX2_PIN_THREADS 0 off / 1 force / else auto) from the sysfs topology.
+    static const ThreadPinning::Plan plan = [] {
+        const auto mode = ThreadPinning::ParseMode(std::getenv("EDEN_NX2_PIN_THREADS"));
+        const ThreadPinning::Topology topology = ReadPinningTopologyLinux();
+        const ThreadPinning::Plan result = ThreadPinning::MakePlan(topology, mode);
+        LOG_INFO(Common, "Thread pinning (Linux): {}",
+                 ThreadPinning::Describe(result, topology, mode));
+        return result;
+    }();
+    u64 mask{};
+    switch (role) {
+    case PinnedRole::GpuFront:
+        mask = plan.front;
+        break;
+    case PinnedRole::GpuBack:
+        mask = plan.back;
+        break;
+    case PinnedRole::GuestCore:
+        mask = plan.guest;
+        break;
+    }
+    if (mask != 0) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        for (int cpu = 0; cpu < 64; ++cpu) {
+            if ((mask >> cpu) & 1) {
+                CPU_SET(cpu, &set);
+            }
+        }
+        if (const int err = pthread_setaffinity_np(pthread_self(), sizeof(set), &set); err != 0) {
+            LOG_WARNING(Common, "Could not pin thread: pthread_setaffinity_np failed ({})", err);
+        } else if (role != PinnedRole::GuestCore) {
+            linux_pinned_gpu_mask.fetch_or(mask, std::memory_order_relaxed);
+        }
+    }
 #else
     (void)role;
 #endif
@@ -781,6 +919,36 @@ u64 BackgroundWorkCpuMask() {
         }
     }
     return std::popcount(other_caches) >= 4 ? other_caches : rest;
+#elif defined(__linux__) && !defined(__ANDROID__)
+    // As on Windows: off the pinned GPU cores, on another L3 (the 2700X's other CCX) when that
+    // leaves at least four logical processors.
+    const u64 pinned = linux_pinned_gpu_mask.load(std::memory_order_relaxed);
+    if (pinned == 0) {
+        return 0;
+    }
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(getpid(), sizeof(allowed), &allowed) != 0) {
+        return 0;
+    }
+    u64 process = 0;
+    for (int cpu = 0; cpu < 64; ++cpu) {
+        if (CPU_ISSET(cpu, &allowed)) {
+            process |= u64{1} << cpu;
+        }
+    }
+    const u64 rest = process & ~pinned;
+    if (rest == 0) {
+        return 0;
+    }
+    static const std::vector<ThreadPinning::Cache> l3_caches = ReadPinningTopologyLinux().l3;
+    u64 other_caches = rest;
+    for (const auto& cache : l3_caches) {
+        if ((cache.mask & pinned) != 0) {
+            other_caches &= ~cache.mask;
+        }
+    }
+    return std::popcount(other_caches) >= 4 ? other_caches : rest;
 #else
     return 0;
 #endif
@@ -797,6 +965,21 @@ void SetCurrentThreadCpuMask(u64 mask) {
         mask = process;
     }
     SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(mask));
+#elif defined(__linux__) && !defined(__ANDROID__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (mask == 0) {
+        if (sched_getaffinity(getpid(), sizeof(set), &set) != 0) {
+            return;
+        }
+    } else {
+        for (int cpu = 0; cpu < 64; ++cpu) {
+            if ((mask >> cpu) & 1) {
+                CPU_SET(cpu, &set);
+            }
+        }
+    }
+    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 #else
     static_cast<void>(mask);
 #endif
