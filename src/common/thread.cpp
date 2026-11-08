@@ -1015,6 +1015,11 @@ void SetCurrentThreadToBackgroundWork() {
     if (const WindowsCpuSets& sets = CpuSets(); sets.hybrid) {
         SelectCurrentThreadCpuSets({});
     }
+#elif defined(__linux__)
+    // A new Linux thread inherits its creator's affinity: worker pools the pinned GPU threads
+    // start (ImageTranscode from GPUBack) would stay on the GPU cores. Windows threads start
+    // with the process affinity instead; do the same.
+    SetCurrentThreadCpuMask(0);
 #endif
 }
 
@@ -1026,6 +1031,9 @@ void SetCurrentThreadToAllCores() {
     if (const WindowsCpuSets& sets = CpuSets(); sets.hybrid) {
         SelectCurrentThreadCpuSets({});
     }
+#elif defined(__linux__)
+    // As SetCurrentThreadToBackgroundWork: drop an affinity inherited from a pinned creator.
+    SetCurrentThreadCpuMask(0);
 #endif
 }
 
