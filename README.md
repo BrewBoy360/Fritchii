@@ -6,6 +6,12 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
+> [!IMPORTANT]
+> **This branch is an unofficial Linux port of Fritchii v4.1** (Frizti's Ocarina of Time fork of Lichii), not an official Lichii or Fritchii release.
+> **Linux users: start with [LINUX.md](LINUX.md)** (what the port changes, tested hardware, build steps). Helper scripts are in [tools/linux/](tools/linux/).
+> Upstream: [Frizti/Fritchii](https://github.com/Frizti/Fritchii) · [zortos293/Lichii](https://github.com/zortos293/Lichii). Games, keys and firmware are not included; bring your own.
+> The rest of this README is upstream Lichii's, unchanged.
+
 <p align="center">
   <img src="dist/branding/lichii_icon_with_logo.png" alt="Lichii" width="600">
 </p>
